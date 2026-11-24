@@ -1,0 +1,45 @@
+---
+title: C3 — Componentes da API REST (HTTP, serviços, domínio e persistência)
+---
+flowchart TB
+  classDef comp fill:#85bbf0,stroke:#5a8fc4,color:#0b1f33
+  classDef db fill:#2f7a4f,stroke:#1f5236,color:#fff
+  classDef queue fill:#b3541e,stroke:#7d3a14,color:#fff
+
+  subgraph API["Container: API REST (Node.js · Express)"]
+    direction TB
+    subgraph HTTP["Camada HTTP"]
+      direction LR
+      mw["<b>Middlewares</b><br/>[middleware.ts]<br/>genReqId · rateLimit · apiKeyAuth<br/>(tempo constante) · validate · errorHandler"]:::comp
+      routes["<b>Rotas REST + DTOs</b><br/>[routes.ts · dto.ts]<br/>leadRoutes · sellerRoutes<br/>(DTO não expõe seq nem phone_raw)"]:::comp
+      schemas["<b>Schemas de entrada</b><br/>[schemas/index.ts · Zod strict]<br/>leads, vendedores, filtros, paginação"]:::comp
+    end
+    subgraph APP["Serviços de aplicação"]
+      direction LR
+      leadSvc["<b>LeadService</b><br/>[lead.service.ts]<br/>criação idempotente por telefone E.164,<br/>listagem com filtros e cursor, histórico"]:::comp
+      sellerSvc["<b>SellerService</b><br/>[seller.service.ts]<br/>cadastro, ativa/desativa (FOR UPDATE),<br/>drena leads pendentes ao ativar"]:::comp
+      distSvc["<b>DistributionService</b><br/>[distribution.service.ts]<br/>round-robin entre ativos (SKIP LOCKED)<br/>e atribuição de pendentes"]:::comp
+    end
+    subgraph INF["Domínio e infraestrutura"]
+      direction LR
+      domain["<b>Domínio</b><br/>[phone.ts · cursor.ts · errors.ts · types.ts]<br/>E.164 (libphonenumber), cursor opaco,<br/>hierarquia de erros"]:::comp
+      txm["<b>Gerenciador de transações</b><br/>[infra/db.ts]<br/>withTransaction: READ COMMITTED +<br/>retry de deadlock (backoff + jitter)"]:::comp
+      repos["<b>Repositórios</b><br/>[lead · seller · lead-event]<br/>SQL parametrizado, participam da<br/>transação do chamador"]:::comp
+    end
+  end
+
+  mysql[("<b>MySQL 8</b><br/>[InnoDB]")]:::db
+  redis[["<b>Redis 7</b><br/>[Streams / contadores]"]]:::queue
+
+  mw -- "INCR/EXPIRE por IP e janela" --> redis
+  mw -- "requisição autenticada" --> routes
+  routes -- "valida body/query/params" --> schemas
+  routes -- "create · list · getById · getEvents" --> leadSvc
+  routes -- "create · get · list · setActive" --> sellerSvc
+  leadSvc -- "assign(conn) na mesma transação" --> distSvc
+  sellerSvc -- "assignPending()" --> distSvc
+  APP -- "normalizePhone · cursor · erros" --> domain
+  APP -- "executa em transação" --> txm
+  APP -- "insert · find · lock · list" --> repos
+  txm -- "BEGIN · COMMIT · ROLLBACK" --> mysql
+  repos -- "SQL [mysql2]" --> mysql

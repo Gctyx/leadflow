@@ -1,0 +1,16 @@
+---
+title: C1 — Diagrama de Contexto · Leadflow Engine
+---
+flowchart TB
+  classDef person fill:#08427b,stroke:#052e56,color:#fff
+  classDef ext fill:#8a8a8a,stroke:#6b6b6b,color:#fff
+  classDef system fill:#1168bd,stroke:#0b4884,color:#fff
+
+  gestor(["<b>Gestor comercial</b><br/>[Pessoa]<br/>Cadastra vendedores e define<br/>quem está ativo ou inativo (via CRM)"]):::person
+  crm(["<b>Sistema comercial / CRM</b><br/>[Pessoa ou sistema interno]<br/>Cria, consulta, lista e filtra leads"]):::person
+  fonte["<b>Fonte externa de leads</b><br/>[Sistema externo]<br/>Landing pages, formulários e plataformas<br/>de anúncio que enviam leads por webhook"]:::ext
+  lf["<b>Leadflow Engine</b><br/>[Sistema de software]<br/>Recebe, deduplica por telefone, distribui<br/>(round-robin) e rastreia leads comerciais"]:::system
+
+  gestor -- "Cadastra vendedores e altera status<br/>[HTTPS/JSON · X-API-Key]" --> lf
+  crm -- "Cria e consulta leads<br/>[HTTPS/JSON · X-API-Key]" --> lf
+  fonte -- "Envia eventos de lead (at-least-once)<br/>[HTTPS/JSON · assinatura HMAC-SHA256]" --> lf

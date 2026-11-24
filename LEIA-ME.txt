@@ -1,0 +1,25 @@
+Leadflow — Executável de um clique
+
+O que você precisa:
+- Windows: Docker Desktop (o executável instala se faltar)
+- macOS/Linux: Docker Engine + Compose v2 já instalados
+
+Como usar (Windows):
+1) Dê dois cliques em Leadflow.exe (após gerar com npm run launcher:build)
+2) Ele vai:
+   - verificar/instalar Docker
+   - gerar .env com senhas/chaves aleatórias
+   - subir MySQL, Redis, migrations, API e worker
+   - abrir o Swagger: http://localhost:<porta>/docs
+
+Comandos:
+- Leadflow.exe start       # sobe tudo
+- Leadflow.exe docs        # abre o Swagger
+- Leadflow.exe keys        # mostra chaves
+- Leadflow.exe stop        # para (mantém dados)
+- Leadflow.exe clean       # apaga containers, volumes e imagens (confirmação APAGAR)
+
+Observações
+- A API escuta em 127.0.0.1; MySQL e Redis não são expostos.
+- As chaves/segredos são gerados localmente e não saem da máquina.
+- macOS/Linux: use `node release/leadflow.cjs` enquanto o binário único não for gerado neste SO.

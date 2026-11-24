@@ -1,0 +1,7 @@
+# Override SOMENTE para desenvolvimento/testes: expõe MySQL e Redis em 127.0.0.1 (nunca na rede).
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d mysql redis
+services:
+  mysql:
+    ports: ["127.0.0.1:3306:3306"]
+  redis:
+    ports: ["127.0.0.1:6379:6379"]

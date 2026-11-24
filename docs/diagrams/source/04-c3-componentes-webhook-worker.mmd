@@ -1,0 +1,49 @@
+---
+title: C3 — Componentes do fluxo de webhook e do Worker
+---
+flowchart TB
+  classDef comp fill:#85bbf0,stroke:#5a8fc4,color:#0b1f33
+  classDef db fill:#2f7a4f,stroke:#1f5236,color:#fff
+  classDef queue fill:#b3541e,stroke:#7d3a14,color:#fff
+  classDef ext fill:#8a8a8a,stroke:#6b6b6b,color:#fff
+
+  fonte["<b>Fonte externa de leads</b><br/>[Sistema externo]"]:::ext
+
+  subgraph API["Container: API REST — recepção"]
+    direction TB
+    sig["<b>webhookSignature + signature.ts</b><br/>[HMAC-SHA256]<br/>assinatura sobre timestamp.corpoBruto,<br/>tolerância anti-replay, rotação de segredos"]:::comp
+    wroutes["<b>webhookRoutes</b><br/>[routes.ts]<br/>guarda o corpo bruto, valida o envelope,<br/>202 (novo) ou 200 (duplicado)"]:::comp
+    ingest["<b>WebhookIngestService</b><br/>[webhook-ingest.service.ts]<br/>persiste no inbox (idempotência source + event_id)<br/>e tenta enfileirar; Redis fora não derruba a recepção"]:::comp
+  end
+
+  subgraph WK["Container: Worker — processamento"]
+    direction TB
+    loops["<b>WebhookWorker</b><br/>[webhook.worker.ts]<br/>laço de consumo (XREADGROUP) e laço de manutenção:<br/>XAUTOCLAIM, re-enfileirar vencidos, modo degradado, atribuir pendentes"]:::comp
+    proc["<b>WebhookProcessor</b><br/>[webhook-processor.service.ts]<br/>claim atômico; cria o lead e marca processed na mesma<br/>transação; classifica retry · duplicate · dead"]:::comp
+    leadSvc["<b>LeadService</b><br/>[lead.service.ts]<br/>mesma regra de criação e deduplicação da API REST"]:::comp
+    backoff["<b>Backoff</b><br/>[backoff.ts]<br/>exponencial com jitter"]:::comp
+  end
+
+  subgraph SHARED["Compartilhado (API e Worker)"]
+    direction LR
+    queue["<b>RedisStreamQueue</b><br/>[redis-stream.queue.ts]<br/>implementa WebhookQueue<br/>sobre Redis Streams (sem BullMQ)"]:::comp
+    whRepo["<b>WebhookEventRepository</b><br/>[webhook-event.repository.ts]<br/>insert · claim (compare-and-set) · markProcessed<br/>scheduleRetry · markDead · findDue"]:::comp
+  end
+
+  mysql[("<b>MySQL 8</b><br/>[webhook_events · leads · lead_events]")]:::db
+  redis[["<b>Redis 7</b><br/>[Stream leadflow:webhooks + consumer group]"]]:::queue
+
+  fonte -- "POST /webhooks/leads" --> sig
+  sig -- "requisição autêntica" --> wroutes
+  wroutes -- "ingest(envelope)" --> ingest
+  ingest -- "insert · findBySourceAndExternalId" --> whRepo
+  ingest -- "enqueue(eventId)" --> queue
+  loops -- "read · ack · claimStale · enqueue" --> queue
+  loops -- "process(eventId)" --> proc
+  loops -- "findDue" --> whRepo
+  proc -- "claim · markDuplicate · scheduleRetry · markDead" --> whRepo
+  proc -- "create(..., inTransaction = markProcessed)" --> leadSvc
+  proc -- "computeBackoffMs" --> backoff
+  queue -- "XADD · XREADGROUP · XACK/XDEL · XAUTOCLAIM [ioredis]" --> redis
+  whRepo -- "SQL [mysql2]" --> mysql
+  leadSvc -- "transação de criação [mysql2]" --> mysql
