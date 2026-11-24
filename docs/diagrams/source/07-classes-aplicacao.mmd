@@ -1,0 +1,131 @@
+---
+title Diagrama de classes (2/2) — Aplicação: serviços, repositórios, fila e segurança
+---
+classDiagram
+  direction TB
+
+  class LeadService {
+    -Pool pool
+    -string phoneRegion
+    +normalize(phone) string
+    +create(input, ctx) Lead
+    +getById(id) Lead
+    +getEvents(id) LeadEvent[]
+    +list(query) Page~Lead~
+  }
+  class SellerService {
+    +create(input) Seller
+    +get(id) Seller
+    +list(filter, limit) Seller[]
+    +setActive(id, active) Seller
+    -drainPending() void
+  }
+  class DistributionService {
+    +assign(conn, leadId, ctx) string|null
+    +assignPending(limit) number
+  }
+  class WebhookIngestService {
+    +ingest(envelope) IngestResult
+  }
+  class WebhookProcessor {
+    +process(eventId) ProcessOutcome
+  }
+  class WebhookWorker {
+    +start() void
+    +stop() void
+    +consumeOnce(blockMs) number
+    +maintenanceTick() void
+  }
+
+  class LeadRepository {
+    +insert(db, newLead) Lead
+    +findById(db, id) Lead
+    +findByPhone(db, e164) Lead
+    +assign(db, leadId, sellerId) void
+    +lockIfUnassigned(db, id) boolean
+    +listUnassignedIds(db, limit) string[]
+    +list(db, filters, limit, beforeSeq) Page
+  }
+  class SellerRepository {
+    +insert(db, data) Seller
+    +findById(db, id, forUpdate) Seller
+    +list(db, filter, limit) Seller[]
+    +setActive(db, id, active) void
+    +lockNextAvailable(db) string|null
+    +touchAssigned(db, id) void
+  }
+  class LeadEventRepository {
+    +append(db, event) void
+    +listByLead(db, leadId) LeadEvent[]
+  }
+  class WebhookEventRepository {
+    +insert(event) void
+    +findBySourceAndExternalId(source, id) WebhookEvent
+    +markEnqueued(id) void
+    +claim(id, lockSeconds) WebhookEvent
+    +markProcessed(conn, id, leadId) void
+    +markDuplicate(id, leadId) void
+    +scheduleRetry(id, delayMs, error) void
+    +markDead(id, error) void
+    +findDue(limit) string[]
+  }
+
+  class WebhookQueue {
+    <<interface>>
+    +init() void
+    +enqueue(eventId) void
+    +read(count, blockMs) QueueMessage[]
+    +claimStale(minIdleMs, count) QueueMessage[]
+    +ack(messageId) void
+    +close() void
+  }
+  class RedisStreamQueue {
+    -Redis redis
+    -Redis reader
+    XADD / XREADGROUP / XACK+XDEL / XAUTOCLAIM
+  }
+
+  class SignatureVerifier {
+    <<module signature.ts>>
+    +signPayload(secret, ts, body) string
+    +verifySignature(input) Result
+  }
+  class AppError {
+    +number status
+    +string code
+    +details
+    +headers
+  }
+  class ValidationError
+  class NotFoundError
+  class UnauthorizedError
+  class ConflictError
+  class DuplicateLeadError {
+    +string existingLeadId
+  }
+  class RateLimitedError
+
+  LeadService --> LeadRepository
+  LeadService --> LeadEventRepository
+  LeadService --> DistributionService : assign na mesma transação
+  SellerService --> SellerRepository
+  SellerService --> DistributionService : assignPending
+  DistributionService --> SellerRepository
+  DistributionService --> LeadRepository
+  DistributionService --> LeadEventRepository
+  WebhookIngestService --> WebhookEventRepository
+  WebhookIngestService --> WebhookQueue
+  WebhookIngestService --> LeadService : normalize
+  WebhookProcessor --> WebhookEventRepository
+  WebhookProcessor --> LeadService : create(inTransaction)
+  WebhookWorker --> WebhookQueue
+  WebhookWorker --> WebhookProcessor
+  WebhookWorker --> WebhookEventRepository
+  WebhookWorker --> DistributionService
+  WebhookQueue <|.. RedisStreamQueue
+  AppError <|-- ValidationError
+  AppError <|-- NotFoundError
+  AppError <|-- UnauthorizedError
+  AppError <|-- ConflictError
+  AppError <|-- RateLimitedError
+  ConflictError <|-- DuplicateLeadError

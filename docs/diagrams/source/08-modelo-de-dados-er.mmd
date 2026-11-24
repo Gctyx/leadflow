@@ -1,0 +1,62 @@
+---
+title Modelo de dados (MySQL 8) — alinhado às migrations 001 a 004
+---
+erDiagram
+  sellers ||--o{ leads : "atende (seller_id)"
+  leads ||--|{ lead_events : "rastreia (lead_id)"
+  sellers |o--o{ lead_events : "seller_id"
+  webhook_events |o--o{ lead_events : "webhook_event_id"
+  leads |o--o{ webhook_events : "lead_id"
+
+  sellers {
+    CHAR36 id PK
+    VARCHAR name
+    VARCHAR email UK "uq_sellers_email"
+    TINYINT active
+    DATETIME6 last_assigned_at "idx_sellers_rr"
+    DATETIME6 created_at
+    DATETIME6 updated_at
+  }
+  leads {
+    CHAR36 id PK
+    BIGINT seq UK "só paginação"
+    VARCHAR name
+    VARCHAR email
+    VARCHAR phone_e164 UK "uq_leads_phone (deduplicação)"
+    VARCHAR phone_raw
+    ENUM channel "api | webhook"
+    VARCHAR origin
+    VARCHAR notes
+    ENUM status "unassigned | assigned (CHECK)"
+    CHAR36 seller_id FK
+    DATETIME6 assigned_at
+    DATETIME6 created_at
+    DATETIME6 updated_at
+  }
+  webhook_events {
+    CHAR36 id PK
+    VARCHAR source UK "uq_webhook_source_event"
+    VARCHAR external_event_id UK "uq_webhook_source_event"
+    JSON payload
+    CHAR64 payload_hash
+    ENUM status "pending|processing|processed|duplicate|dead"
+    INT attempts
+    DATETIME6 next_attempt_at
+    DATETIME6 enqueued_at
+    DATETIME6 locked_until
+    VARCHAR last_error
+    CHAR36 lead_id FK
+    DATETIME6 received_at
+    DATETIME6 processed_at
+  }
+  lead_events {
+    BIGINT seq PK
+    CHAR36 lead_id FK
+    ENUM type "lead.created | lead.assigned | lead.duplicate_attempt"
+    ENUM channel "api | webhook | system"
+    CHAR36 seller_id FK
+    CHAR36 webhook_event_id FK
+    VARCHAR request_id
+    JSON metadata
+    DATETIME6 created_at
+  }

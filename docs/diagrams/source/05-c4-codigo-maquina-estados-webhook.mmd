@@ -1,0 +1,19 @@
+---
+title C4 (código) — Ciclo de vida de webhook_events (WebhookProcessor + WebhookEventRepository)
+---
+stateDiagram-v2
+  direction LR
+  [*] --> pending: POST /webhooks/leads\n(INSERT no inbox)
+  pending --> processing: claim() — UPDATE condicional\nattempts + 1, locked_until
+  processing --> processed: lead criado\n(mesma transação do lead)
+  processing --> duplicate: telefone já existe\n(DuplicateLeadError)
+  processing --> pending: falha transitória\nscheduleRetry (backoff + jitter)
+  processing --> dead: erro permanente (validação)\nou tentativas esgotadas
+  processing --> processing: lock expirou (worker morreu)\nreclaim, attempts + 1
+  processed --> [*]
+  duplicate --> [*]
+  dead --> [*]
+  note right of processing
+    Evento "veneno": attempts passa de
+    WEBHOOK_MAX_ATTEMPTS no claim e vai para dead
+  end note

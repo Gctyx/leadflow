@@ -1,0 +1,113 @@
+---
+title Diagrama de classes (1/2) — Domínio: leads, vendedores, atribuição, deduplicação e rastreabilidade
+---
+classDiagram
+  direction LR
+
+  class Seller {
+    +string id
+    +string name
+    +string email  «único»
+    +boolean active
+    +Date lastAssignedAt  «ponteiro do round-robin»
+    +Date createdAt
+    +Date updatedAt
+  }
+
+  class Lead {
+    +string id  «UUID público»
+    +number seq  «interno, só paginação»
+    +string name
+    +string email
+    +string phone  «E.164 — chave de deduplicação, único»
+    +Channel channel
+    +string origin
+    +string notes
+    +LeadStatus status
+    +string sellerId
+    +Date assignedAt
+    +Date createdAt
+  }
+
+  class LeadEvent {
+    +number seq
+    +string leadId
+    +LeadEventType type
+    +EventChannel channel
+    +string sellerId
+    +string webhookEventId
+    +string requestId
+    +Map metadata
+    +Date createdAt
+  }
+
+  class WebhookEvent {
+    +string id
+    +string source
+    +string externalEventId  «único com source»
+    +WebhookEnvelope payload
+    +string payloadHash
+    +WebhookStatus status
+    +number attempts
+    +Date nextAttemptAt
+    +Date enqueuedAt
+    +Date lockedUntil
+    +string lastError
+    +string leadId
+    +Date receivedAt
+    +Date processedAt
+  }
+
+  class CreateLeadInput {
+    +string name
+    +string phone
+    +string email
+    +string origin
+    +string notes
+  }
+
+  class WebhookEnvelope {
+    +string event_id
+    +string source
+    +CreateLeadInput data
+  }
+
+  class LeadStatus {
+    <<enumeration>>
+    unassigned
+    assigned
+  }
+  class Channel {
+    <<enumeration>>
+    api
+    webhook
+  }
+  class LeadEventType {
+    <<enumeration>>
+    lead.created
+    lead.assigned
+    lead.duplicate_attempt
+  }
+  class WebhookStatus {
+    <<enumeration>>
+    pending
+    processing
+    processed
+    duplicate
+    dead
+  }
+
+  Seller "0..1" <-- "0..*" Lead : atendido por (seller_id)
+  Lead "1" *-- "1..*" LeadEvent : rastreia (append-only)
+  Seller "0..1" <-- "0..*" LeadEvent : atribuído a
+  WebhookEvent "0..1" <-- "0..*" LeadEvent : originado por
+  WebhookEvent "0..*" --> "0..1" Lead : gerou ou duplicou
+  WebhookEnvelope "1" *-- "1" CreateLeadInput : data
+  WebhookEvent "1" *-- "1" WebhookEnvelope : payload
+  Lead ..> LeadStatus
+  Lead ..> Channel
+  LeadEvent ..> LeadEventType
+  WebhookEvent ..> WebhookStatus
+
+  note for Lead "Invariante (CHECK no MySQL): unassigned ⇒ sem vendedor e sem assigned_at; assigned ⇒ com vendedor e assigned_at. UNIQUE(phone_e164) impede duplicidade mesmo sob concorrência"
+  note for LeadEvent "Cada lead tem ao menos 'lead.created'; 'lead.assigned' quando recebe vendedor; 'lead.duplicate_attempt' a cada tentativa repetida"

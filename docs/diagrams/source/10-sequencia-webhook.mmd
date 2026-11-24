@@ -1,0 +1,55 @@
+---
+title Sequência — Webhook: recepção durável, fila Redis e processamento com recuperação
+---
+sequenceDiagram
+  autonumber
+  participant S as Fonte externa
+  participant API as API REST
+  participant DB as MySQL (inbox)
+  participant R as Redis Stream
+  participant W as Worker
+  participant L as LeadService
+
+  S->>API: POST /webhooks/leads + X-Leadflow-Timestamp + X-Leadflow-Signature
+  API->>API: rate limit, HMAC sobre timestamp.corpoBruto (tolerância, rotação de segredos)
+  alt assinatura inválida/expirada
+    API-->>S: 401 genérico (motivo só no log)
+  else assinatura válida
+    API->>API: validate envelope (Zod) + telefone válido
+    API->>DB: INSERT webhook_events (UNIQUE source + event_id)
+    alt mesmo event_id e mesmo hash (reentrega)
+      API-->>S: 200 duplicate (emissor para de retentar)
+    else mesmo event_id, conteúdo diferente
+      API-->>S: 409 EVENT_ID_REUSED
+    else evento novo
+      API->>R: XADD event_id (best-effort)
+      API->>DB: UPDATE enqueued_at
+      API-->>S: 202 accepted
+    end
+  end
+
+  loop consumo contínuo
+    W->>R: XREADGROUP (consumer group)
+    R-->>W: mensagem (event_id)
+    W->>DB: claim atômico (pending→processing, attempts+1, locked_until)
+    alt claim falhou (duplicata de entrega / já processado)
+      W->>R: XACK + XDEL (no-op)
+    else claim ok
+      W->>L: create(payload, inTransaction=markProcessed)
+      L->>DB: lead + eventos + status=processed (mesma transação)
+      W->>R: XACK + XDEL
+    end
+  end
+
+  Note over W,DB: Falha transitória → scheduleRetry (backoff exponencial + jitter)<br/>Erro permanente ou tentativas esgotadas → dead<br/>Telefone já existente → duplicate (sem retry)
+
+  loop manutenção periódica
+    W->>R: XAUTOCLAIM mensagens órfãs (worker morreu sem ACK)
+    W->>DB: findDue (pending vencido não enfileirado, processing com lock expirado)
+    alt Redis disponível
+      W->>R: XADD + UPDATE enqueued_at
+    else Redis indisponível (modo degradado)
+      W->>L: processa direto a partir do MySQL
+    end
+    W->>DB: assignPending (leads sem vendedor)
+  end

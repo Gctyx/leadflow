@@ -1,0 +1,168 @@
+# Leadflow Engine — ambiente completo: MySQL 8 + Redis + migrations + API + worker.
+#
+#   Um clique:  Leadflow.exe (Windows) · leadflow-macos-* (macOS) · leadflow-linux-* (Linux)  — ver LEIA-ME.txt
+#   Manual:     gere o .env (ver .env.example, bloco "Docker Compose") e rode `docker compose up --build -d`
+#
+# Segurança por padrão:
+#   * MySQL e Redis NÃO são publicados no host (só a rede interna do compose enxerga); a API escuta apenas em 127.0.0.1.
+#   * Nenhum segredo padrão: se faltar variável no .env o compose se recusa a subir (`:?`).
+#   * Redis com senha; containers da aplicação sem privilégios (cap_drop ALL, no-new-privileges, filesystem somente leitura).
+#   * Para rodar os testes contra esse MySQL/Redis, use o override docker-compose.dev.yml (expõe só em 127.0.0.1).
+name: leadflow
+
+x-app-env: &app-env
+  NODE_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  DOCS_ENABLED: ${DOCS_ENABLED:-true}
+  DATABASE_URL: mysql://leadflow:${MYSQL_PASSWORD:?defina MYSQL_PASSWORD no .env}@mysql:3306/leadflow
+  REDIS_URL: redis://:${REDIS_PASSWORD:?defina REDIS_PASSWORD no .env}@redis:6379
+  API_KEYS: ${API_KEYS:?defina API_KEYS no .env}
+  WEBHOOK_SECRETS: ${WEBHOOK_SECRETS:?defina WEBHOOK_SECRETS no .env}
+  WORKER_INLINE: "false"
+
+x-hardened: &hardened
+  read_only: true
+  tmpfs: ["/tmp"]
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 256
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_DATABASE: leadflow
+      MYSQL_USER: leadflow
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?defina MYSQL_PASSWORD no .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?defina MYSQL_ROOT_PASSWORD no .env}
+    # Binlog habilitado para PITR; GTID simplifica replicação/restore. Ajuste retenção conforme RPO (aqui: 30 dias)
+    command: [
+      "--character-set-server=utf8mb4",
+      "--collation-server=utf8mb4_0900_ai_ci",
+      "--default-time-zone=+00:00",
+      "--local-infile=0",
+      "--server-id=1",
+      "--log-bin=/var/lib/mysql/binlog",
+      "--binlog-format=ROW",
+      "--binlog-expire-logs-seconds=2592000",
+      "--gtid-mode=ON",
+      "--enforce-gtid-consistency=ON"
+    ]
+    volumes: ["mysql-data:/var/lib/mysql"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uleadflow -p\"$$MYSQL_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?defina REDIS_PASSWORD no .env}
+    # AOF ligado: a fila (Streams) sobrevive a reinício do Redis. Mesmo sem isso, o inbox no MySQL recupera os eventos.
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes: ["redis-data:/data"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    <<: *hardened
+    command: ["node", "dist/infra/migrate.js"]
+    environment: *app-env
+    healthcheck:
+      disable: true
+    depends_on:
+      mysql: { condition: service_healthy }
+    restart: "no"
+
+  api:
+    build: .
+    <<: *hardened
+    environment: *app-env
+    # Somente loopback: não fica acessível para outros computadores da rede.
+    ports: ["127.0.0.1:${LEADFLOW_PORT:-3000}:3000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  # Balanceador de carga (edge) com Nginx: TLS/HTTP2/Rate limit/health check.
+  # Em desenvolvimento sem TLS, cookies Secure não serão setados pelo navegador. Para produção, monte certificados válidos em nginx/certs.
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+  worker:
+    build: .
+    <<: *hardened
+    command: ["node", "dist/worker.js"]
+    environment: *app-env
+    healthcheck:
+      disable: true   # o worker não tem servidor HTTP (o HEALTHCHECK da imagem é da API)
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+    # Escala horizontal: `docker compose up -d --scale worker=3` (o consumer group distribui as mensagens)
+
+  # Runner de backup (XtraBackup) — execução sob demanda: `docker compose run --rm backup-runner /backup/backup.sh full`
+  backup-runner:
+    image: percona/percona-xtrabackup:8.0
+    command: ["sleep","infinity"]
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD:?defina MYSQL_ROOT_PASSWORD no .env}
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_REGION: ${S3_REGION}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      BACKUP_CONCURRENCY: ${BACKUP_CONCURRENCY:-2}
+      BACKUP_RETENTION_FULL: ${BACKUP_RETENTION_FULL:-7}
+      BACKUP_RETENTION_INC: ${BACKUP_RETENTION_INC:-48}
+    volumes:
+      - mysql-data:/var/lib/mysql:ro
+      - mysql-backups:/backups
+      - ./backup:/backup:ro
+    depends_on:
+      mysql: { condition: service_healthy }
+    restart: "no"
+
+  # Agendador de backups (crontab)
+  backup-scheduler:
+    image: alpine:3
+    command: ["/bin/sh","-c","crond -f -l 8"]
+    environment:
+      TZ: UTC
+    volumes:
+      - ./backup/crontab:/etc/crontabs/root:ro
+      - mysql-data:/var/lib/mysql:ro
+      - mysql-backups:/backups
+      - ./backup:/backup:ro
+    depends_on:
+      mysql: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:
+  mysql-backups:

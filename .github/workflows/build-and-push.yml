@@ -1,0 +1,80 @@
+name: Build and Push Images
+
+on:
+  push:
+    branches: ['homolog','main']
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}/api
+            ghcr.io/${{ github.repository }}/worker
+            ghcr.io/${{ github.repository }}/migrate
+          tags: |
+            type=sha
+            type=raw,value=${{ github.ref_name }}
+
+      - name: Build+push API
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          push: true
+          tags: ghcr.io/${{ github.repository }}/api:${{ steps.meta.outputs.version }}
+
+      - name: Build+push Worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          push: true
+          tags: ghcr.io/${{ github.repository }}/worker:${{ steps.meta.outputs.version }}
+
+      - name: Build+push Migrate
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          push: true
+          tags: ghcr.io/${{ github.repository }}/migrate:${{ steps.meta.outputs.version }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign images (keyless)
+        env:
+          DIGEST_API: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -eu
+          # Sign each image ref by tag
+          for img in api worker migrate; do
+            cosign sign --yes ghcr.io/${{ github.repository }}/$img:${{ steps.meta.outputs.version }}
+          done

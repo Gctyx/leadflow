@@ -1,0 +1,40 @@
+---
+title Sequência — POST /api/v1/leads (deduplicação concorrente + distribuição)
+---
+sequenceDiagram
+  autonumber
+  actor C as Cliente (CRM)
+  participant API as API REST
+  participant R as Redis
+  participant L as LeadService
+  participant D as DistributionService
+  participant DB as MySQL
+
+  C->>API: POST /api/v1/leads (X-API-Key, JSON)
+  API->>R: INCR/EXPIRE rate limit (fail-open se Redis cair)
+  API->>API: apiKeyAuth, validate (Zod strict)
+  API->>L: create(input, channel=api, requestId)
+  L->>L: normalize(phone) → E.164
+  L->>DB: BEGIN (READ COMMITTED)
+  L->>DB: INSERT leads (...)
+  alt telefone novo (venceu a disputa pela UNIQUE)
+    L->>DB: INSERT lead_events (lead.created)
+    L->>D: assign(conn, leadId)
+    D->>DB: SELECT vendedor ativo ORDER BY last_assigned_at FOR UPDATE SKIP LOCKED
+    alt há vendedor ativo
+      D->>DB: UPDATE sellers.last_assigned_at
+      D->>DB: UPDATE leads SET seller_id, status=assigned WHERE status=unassigned
+      D->>DB: INSERT lead_events (lead.assigned, strategy=round_robin)
+    else nenhum vendedor ativo
+      D-->>L: null (lead permanece unassigned)
+    end
+    L->>DB: COMMIT
+    L-->>API: Lead
+    API-->>C: 201 Created + Location
+  else ER_DUP_ENTRY em uq_leads_phone (perdeu a disputa)
+    L->>DB: ROLLBACK
+    L->>DB: SELECT lead existente por phone_e164
+    L->>DB: INSERT lead_events (lead.duplicate_attempt)
+    L-->>API: DuplicateLeadError
+    API-->>C: 409 LEAD_ALREADY_EXISTS (lead_id)
+  end

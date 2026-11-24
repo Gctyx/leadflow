@@ -1,0 +1,6 @@
+# full diário às 02:30 UTC
+30 2 * * * /backup/backup.sh full >> /backups/cron.log 2>&1
+# incremental de hora em hora
+0 * * * * /backup/backup.sh incremental >> /backups/cron.log 2>&1
+# verificação semanal (domingo 03:30 UTC)
+30 3 * * 0 /backup/verify-restore.sh >> /backups/cron.log 2>&1

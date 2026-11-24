@@ -1,0 +1,29 @@
+---
+title: C2 — Diagrama de Containers · Leadflow Engine
+---
+flowchart TB
+  classDef person fill:#08427b,stroke:#052e56,color:#fff
+  classDef ext fill:#8a8a8a,stroke:#6b6b6b,color:#fff
+  classDef container fill:#438dd5,stroke:#2e6295,color:#fff
+  classDef db fill:#2f7a4f,stroke:#1f5236,color:#fff
+  classDef queue fill:#b3541e,stroke:#7d3a14,color:#fff
+
+  crm(["<b>Sistema comercial / CRM</b><br/>[Pessoa ou sistema interno]"]):::person
+  fonte["<b>Fonte externa de leads</b><br/>[Sistema externo]<br/>envia webhooks assinados"]:::ext
+
+  subgraph LF["Leadflow Engine — limite do sistema"]
+    direction TB
+    api["<b>API REST</b><br/>[Container: Node.js 22 · TypeScript · Express 5]<br/>Valida entrada, autentica (API key / HMAC), aplica rate limit,<br/>expõe leads, vendedores e webhook.<br/>Persiste o evento no MySQL antes de responder 202"]:::container
+    worker["<b>Worker de webhooks</b><br/>[Container: Node.js 22 · TypeScript]<br/>processo separado (ou inline na API)<br/>Consome o stream, faz retry com backoff, recupera mensagens órfãs,<br/>re-enfileira eventos vencidos e atribui leads represados"]:::container
+    migrator["<b>Migrator</b><br/>[Container: Node.js · SQL puro]<br/>job de uso único: migrations com<br/>GET_LOCK e checksum"]:::container
+    mysql[("<b>MySQL 8</b><br/>[Banco: InnoDB · READ COMMITTED]<br/>Fonte da verdade: sellers, leads,<br/>webhook_events (inbox) e lead_events")]:::db
+    redis[["<b>Redis 7</b><br/>[Fila: Streams + consumer group · AOF]<br/>fila de webhooks e contadores do rate limit"]]:::queue
+  end
+
+  crm -- "REST /api/v1/leads, /sellers<br/>[HTTPS/JSON · X-API-Key]" --> api
+  fonte -- "POST /api/v1/webhooks/leads<br/>[HTTPS/JSON · HMAC]" --> api
+  api -- "SQL<br/>[mysql2 · pool]" --> mysql
+  api -- "XADD · INCR/EXPIRE (fail-open)<br/>[ioredis]" --> redis
+  worker -- "XREADGROUP · XACK/XDEL<br/>XAUTOCLAIM · XADD<br/>[ioredis]" --> redis
+  worker -- "claim atômico · cria leads · estado do evento<br/>[mysql2 · pool]" --> mysql
+  migrator -- "aplica migrations<br/>[mysql2]" --> mysql

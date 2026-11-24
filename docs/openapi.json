@@ -1,0 +1,1820 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Leadflow Engine API",
+    "version": "1.0.0",
+    "description": "API REST para **receber, deduplicar, distribuir e rastrear leads comerciais** (desafio Backend Sênior — LexVita).\n\n## Como testar nesta página\n1. Clique em **Authorize** e informe a sua `X-API-Key` (no executável: opção *Mostrar chaves*; no Docker: variável `API_KEYS`).\n2. Cadastre um vendedor em `POST /sellers` e depois um lead em `POST /leads` — o lead é distribuído (round-robin) para um vendedor ativo.\n3. Consulte a trilha de auditoria em `GET /leads/{id}/events`.\n\n## Autenticação\n| Superfície | Mecanismo |\n|---|---|\n| `/leads`, `/sellers` | Cabeçalho `X-API-Key` (mais de uma chave válida permite rotação sem downtime) |\n| `/webhooks/leads` | Assinatura HMAC-SHA256 (sem API key) — veja a operação para o algoritmo |\n| `/health/*` | Públicos |\n\n## Convenções\n* JSON em UTF-8; datas em ISO-8601 UTC; telefones normalizados para **E.164** (região padrão `BR`).\n* Todas as respostas trazem `X-Request-Id` (aceita o seu, no formato `[\\w-]{8,64}`) e `RateLimit-Limit` / `RateLimit-Remaining`.\n* Campos desconhecidos no corpo são **rejeitados** (`422`). Erros nunca incluem stack trace, SQL nem o valor enviado.\n* Paginação por **cursor** (keyset): use `page.next_cursor` como `cursor` na próxima chamada; `null` indica o fim.\n\nDocumentação completa: `docs/API.md` e `README.md` do repositório.",
+    "license": {
+      "name": "ISC"
+    }
+  },
+  "servers": [
+    {
+      "url": "/api/v1",
+      "description": "Mesma origem desta página"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Leads",
+      "description": "Cadastro, consulta, filtros, paginação e trilha de rastreabilidade."
+    },
+    {
+      "name": "Sellers",
+      "description": "Vendedores (ativo/inativo) que participam da distribuição."
+    },
+    {
+      "name": "Webhooks",
+      "description": "Entrada assíncrona e idempotente de leads de fontes externas."
+    },
+    {
+      "name": "Health",
+      "description": "Liveness e readiness (fora de `/api/v1`)."
+    }
+  ],
+  "security": [
+    {
+      "ApiKeyAuth": []
+    }
+  ],
+  "paths": {
+    "/leads": {
+      "post": {
+        "tags": [
+          "Leads"
+        ],
+        "operationId": "createLead",
+        "summary": "Criar lead",
+        "description": "Normaliza o telefone para E.164 e distribui o lead para o vendedor ativo menos recentemente atendido (round-robin).\n\n* Sem vendedor ativo: o lead nasce `unassigned` (`seller_id: null`) e é atribuído quando houver um vendedor.\n* Telefone repetido, em **qualquer formato** (`11912345678`, `+55 11 91234-5678`…), retorna `409 LEAD_ALREADY_EXISTS`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateLeadRequest"
+              },
+              "example": {
+                "name": "Ana Souza",
+                "phone": "(11) 91234-5678",
+                "email": "ana@example.com",
+                "origin": "landing_page",
+                "notes": "Pediu contato à tarde"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Lead criado (e atribuído, se havia vendedor ativo).",
+            "headers": {
+              "Location": {
+                "description": "URL do lead criado.",
+                "schema": {
+                  "type": "string",
+                  "example": "/api/v1/leads/0b7f6a3e-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+                }
+              },
+              "RateLimit-Limit": {
+                "description": "Limite de requisições por janela.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requisições restantes na janela atual.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Id de correlação (use-o ao reportar problemas; aparece também nos logs).",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Lead"
+                },
+                "example": {
+                  "id": "0b7f6a3e-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
+                  "name": "Ana Souza",
+                  "email": "ana@example.com",
+                  "phone": "+5511912345678",
+                  "channel": "api",
+                  "origin": "landing_page",
+                  "notes": null,
+                  "status": "assigned",
+                  "seller_id": "9d1c2b3a-4f5e-4a6b-9c7d-8e9f0a1b2c3d",
+                  "assigned_at": "2026-11-24T21:00:00.000Z",
+                  "created_at": "2026-11-24T21:00:00.000Z",
+                  "updated_at": "2026-11-24T21:00:00.000Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidBody"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "Já existe um lead com este telefone (normalizado). `details.lead_id` aponta o existente.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": {
+                    "code": "LEAD_ALREADY_EXISTS",
+                    "message": "Já existe um lead com este telefone",
+                    "details": {
+                      "lead_id": "0b7f6a3e-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+                    },
+                    "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f"
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Leads"
+        ],
+        "operationId": "listLeads",
+        "summary": "Listar, filtrar e paginar leads",
+        "description": "Filtros combináveis (todos opcionais). Ordem: mais recentes primeiro. Paginação **keyset** — custo constante e sem repetir/perder itens com inserções concorrentes.",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "description": "Situação da atribuição.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "unassigned",
+                "assigned"
+              ]
+            }
+          },
+          {
+            "name": "seller_id",
+            "in": "query",
+            "required": false,
+            "description": "Somente leads deste vendedor.",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "channel",
+            "in": "query",
+            "required": false,
+            "description": "Canal de entrada.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "api",
+                "webhook"
+              ]
+            }
+          },
+          {
+            "name": "origin",
+            "in": "query",
+            "required": false,
+            "description": "Origem informada no cadastro.",
+            "schema": {
+              "type": "string",
+              "minLength": 2,
+              "maxLength": 60,
+              "pattern": "^[\\w.:\\- ]+$",
+              "description": "Letras, números e `. : _ -`."
+            }
+          },
+          {
+            "name": "phone",
+            "in": "query",
+            "required": false,
+            "description": "Telefone (normalizado antes de comparar; qualquer formato).",
+            "schema": {
+              "type": "string",
+              "minLength": 8,
+              "maxLength": 32
+            }
+          },
+          {
+            "name": "email",
+            "in": "query",
+            "required": false,
+            "description": "E-mail exato (minúsculo).",
+            "schema": {
+              "type": "string",
+              "format": "email",
+              "maxLength": 254
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "required": false,
+            "description": "Prefixo do nome.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 120
+            }
+          },
+          {
+            "name": "created_from",
+            "in": "query",
+            "required": false,
+            "description": "Criados a partir de (ISO-8601, com fuso).",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "created_to",
+            "in": "query",
+            "required": false,
+            "description": "Criados até (ISO-8601, com fuso).",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Itens por página (1–100).",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Cursor opaco retornado em `page.next_cursor`.",
+            "schema": {
+              "type": "string",
+              "maxLength": 40,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Página de leads.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Limite de requisições por janela.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requisições restantes na janela atual.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Id de correlação (use-o ao reportar problemas; aparece também nos logs).",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeadPage"
+                },
+                "example": {
+                  "data": [
+                    {
+                      "id": "0b7f6a3e-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
+                      "name": "Ana Souza",
+                      "email": "ana@example.com",
+                      "phone": "+5511912345678",
+                      "channel": "api",
+                      "origin": "landing_page",
+                      "notes": null,
+                      "status": "assigned",
+                      "seller_id": "9d1c2b3a-4f5e-4a6b-9c7d-8e9f0a1b2c3d",
+                      "assigned_at": "2026-11-24T21:00:00.000Z",
+                      "created_at": "2026-11-24T21:00:00.000Z",
+                      "updated_at": "2026-11-24T21:00:00.000Z"
+                    }
+                  ],
+                  "page": {
+                    "limit": 20,
+                    "next_cursor": "MTQ5"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/leads/{id}": {
+      "get": {
+        "tags": [
+          "Leads"
+        ],
+        "operationId": "getLead",
+        "summary": "Consultar lead",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Identificador (UUID).",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "O lead.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Limite de requisições por janela.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requisições restantes na janela atual.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Id de correlação (use-o ao reportar problemas; aparece também nos logs).",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Lead"
+                },
+                "example": {
+                  "id": "0b7f6a3e-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
+                  "name": "Ana Souza",
+                  "email": "ana@example.com",
+                  "phone": "+5511912345678",
+                  "channel": "api",
+                  "origin": "landing_page",
+                  "notes": null,
+                  "status": "assigned",
+                  "seller_id": "9d1c2b3a-4f5e-4a6b-9c7d-8e9f0a1b2c3d",
+                  "assigned_at": "2026-11-24T21:00:00.000Z",
+                  "created_at": "2026-11-24T21:00:00.000Z",
+                  "updated_at": "2026-11-24T21:00:00.000Z"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/leads/{id}/events": {
+      "get": {
+        "tags": [
+          "Leads"
+        ],
+        "operationId": "listLeadEvents",
+        "summary": "Trilha de rastreabilidade do lead",
+        "description": "Registro **append-only** do que aconteceu com o lead: `lead.created`, `lead.assigned` e `lead.duplicate_attempt` (cada nova tentativa de cadastrar o mesmo telefone). Canais: `api`, `webhook` e `system` (atribuição posterior feita pelo sistema).",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Identificador (UUID).",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Eventos em ordem cronológica.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Limite de requisições por janela.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requisições restantes na janela atual.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Id de correlação (use-o ao reportar problemas; aparece também nos logs).",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeadEventList"
+                },
+                "example": {
+                  "data": [
+                    {
+                      "type": "lead.created",
+                      "channel": "api",
+                      "seller_id": null,
+                      "webhook_event_id": null,
+                      "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f",
+                      "metadata": null,
+                      "created_at": "2026-11-24T21:00:00.000Z"
+                    },
+                    {
+                      "type": "lead.assigned",
+                      "channel": "api",
+                      "seller_id": "9d1c2b3a-4f5e-4a6b-9c7d-8e9f0a1b2c3d",
+                      "webhook_event_id": null,
+                      "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f",
+                      "metadata": {
+                        "strategy": "round_robin"
+                      },
+                      "created_at": "2026-11-24T21:00:00.000Z"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/sellers": {
+      "post": {
+        "tags": [
+          "Sellers"
+        ],
+        "operationId": "createSeller",
+        "summary": "Cadastrar vendedor",
+        "description": "Se nascer ativo, os leads represados (`unassigned`) são distribuídos.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSellerRequest"
+              },
+              "example": {
+                "name": "Carlos Lima",
+                "email": "carlos@example.com",
+                "active": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Vendedor criado.",
+            "headers": {
+              "Location": {
+                "description": "URL do vendedor criado.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "RateLimit-Limit": {
+                "description": "Limite de requisições por janela.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requisições restantes na janela atual.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Id de correlação (use-o ao reportar problemas; aparece também nos logs).",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Seller"
+                },
+                "example": {
+                  "id": "9d1c2b3a-4f5e-4a6b-9c7d-8e9f0a1b2c3d",
+                  "name": "Carlos Lima",
+                  "email": "carlos@example.com",
+                  "active": true,
+                  "last_assigned_at": "2026-11-24T21:00:00.000Z",
+                  "created_at": "2026-11-24T20:00:00.000Z",
+                  "updated_at": "2026-11-24T21:00:00.000Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidBody"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "Já existe um vendedor com este e-mail.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": {
+                    "code": "SELLER_ALREADY_EXISTS",
+                    "message": "Já existe um vendedor com este e-mail",
+                    "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f"
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Sellers"
+        ],
+        "operationId": "listSellers",
+        "summary": "Listar vendedores",
+        "parameters": [
+          {
+            "name": "active",
+            "in": "query",
+            "required": false,
+            "description": "Filtra por ativo (`true`) ou inativo (`false`).",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Máximo de itens (1–100).",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Vendedores.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Limite de requisições por janela.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requisições restantes na janela atual.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Id de correlação (use-o ao reportar problemas; aparece também nos logs).",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SellerList"
+                },
+                "example": {
+                  "data": [
+                    {
+                      "id": "9d1c2b3a-4f5e-4a6b-9c7d-8e9f0a1b2c3d",
+                      "name": "Carlos Lima",
+                      "email": "carlos@example.com",
+                      "active": true,
+                      "last_assigned_at": "2026-11-24T21:00:00.000Z",
+                      "created_at": "2026-11-24T20:00:00.000Z",
+                      "updated_at": "2026-11-24T21:00:00.000Z"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/sellers/{id}": {
+      "get": {
+        "tags": [
+          "Sellers"
+        ],
+        "operationId": "getSeller",
+        "summary": "Consultar vendedor",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Identificador (UUID).",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "O vendedor.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Limite de requisições por janela.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requisições restantes na janela atual.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Id de correlação (use-o ao reportar problemas; aparece também nos logs).",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Seller"
+                },
+                "example": {
+                  "id": "9d1c2b3a-4f5e-4a6b-9c7d-8e9f0a1b2c3d",
+                  "name": "Carlos Lima",
+                  "email": "carlos@example.com",
+                  "active": true,
+                  "last_assigned_at": "2026-11-24T21:00:00.000Z",
+                  "created_at": "2026-11-24T20:00:00.000Z",
+                  "updated_at": "2026-11-24T21:00:00.000Z"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Sellers"
+        ],
+        "operationId": "updateSeller",
+        "summary": "Ativar / desativar vendedor",
+        "description": "Desativar tira o vendedor da rotação **imediatamente** (a linha é travada: nenhuma atribuição em andamento chega a um vendedor já desativado). Leads já atribuídos permanecem com ele. Reativar devolve o vendedor à rotação e drena leads represados.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Identificador (UUID).",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSellerRequest"
+              },
+              "example": {
+                "active": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Vendedor atualizado.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Limite de requisições por janela.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requisições restantes na janela atual.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Id de correlação (use-o ao reportar problemas; aparece também nos logs).",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Seller"
+                },
+                "example": {
+                  "id": "9d1c2b3a-4f5e-4a6b-9c7d-8e9f0a1b2c3d",
+                  "name": "Carlos Lima",
+                  "email": "carlos@example.com",
+                  "active": false,
+                  "last_assigned_at": "2026-11-24T21:00:00.000Z",
+                  "created_at": "2026-11-24T20:00:00.000Z",
+                  "updated_at": "2026-11-24T21:00:00.000Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidBody"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/webhooks/leads": {
+      "post": {
+        "tags": [
+          "Webhooks"
+        ],
+        "operationId": "receiveLeadWebhook",
+        "summary": "Receber lead por webhook assinado",
+        "description": "**Persistir primeiro, processar depois:** o evento é validado e gravado de forma durável (`202`); o lead será criado de forma assíncrona pelo worker, com efeito exatamente-uma-vez.\n\n**Idempotência:** `(source, event_id)` é a chave. Reentrega idêntica → `200 duplicate` (o emissor deve parar de retentar); mesmo `event_id` com conteúdo diferente → `409 EVENT_ID_REUSED`.\n\n### Assinatura (HMAC-SHA256)\n| Cabeçalho | Valor |\n|---|---|\n| `X-Leadflow-Timestamp` | epoch em **segundos** (10 dígitos); aceito dentro de ±`WEBHOOK_TOLERANCE_SECONDS` (padrão 300 s) |\n| `X-Leadflow-Signature` | `v1=` + hex( HMAC-SHA256( segredo, `\"{timestamp}.\" + corpoBrutoExato` ) ) |\n\nA assinatura cobre os **bytes exatos** enviados: não reformate o JSON depois de assinar.\n\n```bash\nTS=$(date +%s)\nBODY='{\"event_id\":\"evt_20261124_0001\",\"source\":\"landing_page\",\"data\":{\"name\":\"Ana Souza\",\"phone\":\"11912345678\"}}'\nSIG=$(printf '%s.%s' \"$TS\" \"$BODY\" | openssl dgst -sha256 -hmac \"$WEBHOOK_SECRET\" | sed 's/^.* //')\ncurl -i -X POST http://localhost:3000/api/v1/webhooks/leads -H \"Content-Type: application/json\" \\\n  -H \"X-Leadflow-Timestamp: $TS\" -H \"X-Leadflow-Signature: v1=$SIG\" --data-raw \"$BODY\"\n```\n\nAtalhos: `npm run webhook:sign` ou `Leadflow.exe sign`. O botão *Try it out* **não consegue** calcular o HMAC — use um dos comandos acima.",
+        "security": [
+          {
+            "WebhookSignature": [],
+            "WebhookTimestamp": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebhookEnvelope"
+              },
+              "example": {
+                "event_id": "evt_20261124_0001",
+                "source": "landing_page",
+                "data": {
+                  "name": "Ana Souza",
+                  "phone": "(11) 91234-5678",
+                  "email": "ana@example.com"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Reentrega do mesmo evento (idempotência). Nada foi duplicado; o emissor deve parar de retentar.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookDuplicate"
+                },
+                "example": {
+                  "status": "duplicate",
+                  "event_id": "evt_20261124_0001",
+                  "processing_status": "processed"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Evento aceito e gravado de forma durável; o lead será criado de forma assíncrona.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Limite de requisições por janela.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requisições restantes na janela atual.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Id de correlação (use-o ao reportar problemas; aparece também nos logs).",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookAccepted"
+                },
+                "example": {
+                  "status": "accepted",
+                  "event_id": "evt_20261124_0001"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidBody"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "Mesmo `event_id` já usado com conteúdo diferente.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": {
+                    "code": "EVENT_ID_REUSED",
+                    "message": "event_id já utilizado com outro conteúdo",
+                    "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f"
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/health/live": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "operationId": "healthLive",
+        "summary": "Liveness",
+        "description": "O processo está no ar.",
+        "servers": [
+          {
+            "url": "/"
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Processo no ar.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                },
+                "example": {
+                  "status": "ok"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "operationId": "healthReady",
+        "summary": "Readiness",
+        "description": "`ok`; `degraded` (Redis fora: a API continua atendendo e os webhooks ficam no MySQL); `unavailable` (MySQL fora → 503).",
+        "servers": [
+          {
+            "url": "/"
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Pronta (`ok`) ou degradada (`degraded`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                },
+                "example": {
+                  "status": "ok"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "MySQL indisponível.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                },
+                "example": {
+                  "status": "unavailable"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "Chave da API (valores de `API_KEYS`)."
+      },
+      "WebhookTimestamp": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Leadflow-Timestamp",
+        "description": "Epoch em segundos usado na assinatura."
+      },
+      "WebhookSignature": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Leadflow-Signature",
+        "description": "`v1=` + HMAC-SHA256 em hexadecimal."
+      }
+    },
+    "schemas": {
+      "CreateLeadRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "phone"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120,
+            "description": "Sem caracteres de controle.",
+            "example": "Ana Souza"
+          },
+          "phone": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 32,
+            "description": "Qualquer formato; normalizado para E.164 (região padrão `BR`). Inválido → 422.",
+            "example": "(11) 91234-5678"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 254,
+            "description": "Convertido para minúsculas.",
+            "example": "ana@example.com"
+          },
+          "origin": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 60,
+            "pattern": "^[\\w.:\\- ]+$",
+            "description": "Letras, números e `. : _ -`.",
+            "example": "landing_page"
+          },
+          "notes": {
+            "type": "string",
+            "maxLength": 1000
+          }
+        }
+      },
+      "Lead": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "email",
+          "phone",
+          "channel",
+          "origin",
+          "notes",
+          "status",
+          "seller_id",
+          "assigned_at",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Identificador público do lead."
+          },
+          "name": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "nullable": true
+          },
+          "phone": {
+            "type": "string",
+            "description": "E.164.",
+            "example": "+5511912345678"
+          },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "api",
+              "webhook"
+            ]
+          },
+          "origin": {
+            "type": "string",
+            "nullable": true
+          },
+          "notes": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "unassigned",
+              "assigned"
+            ]
+          },
+          "seller_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Vendedor responsável.",
+            "nullable": true
+          },
+          "assigned_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Momento da atribuição.",
+            "nullable": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Criação."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Última alteração."
+          }
+        }
+      },
+      "LeadPage": {
+        "type": "object",
+        "required": [
+          "data",
+          "page"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Lead"
+            }
+          },
+          "page": {
+            "type": "object",
+            "required": [
+              "limit",
+              "next_cursor"
+            ],
+            "properties": {
+              "limit": {
+                "type": "integer"
+              },
+              "next_cursor": {
+                "type": "string",
+                "nullable": true,
+                "description": "Cursor opaco da próxima página; `null` quando acabou."
+              }
+            }
+          }
+        }
+      },
+      "LeadEvent": {
+        "type": "object",
+        "required": [
+          "type",
+          "channel",
+          "seller_id",
+          "webhook_event_id",
+          "request_id",
+          "metadata",
+          "created_at"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "lead.created",
+              "lead.assigned",
+              "lead.duplicate_attempt"
+            ]
+          },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "api",
+              "webhook",
+              "system"
+            ]
+          },
+          "seller_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Vendedor envolvido (atribuição).",
+            "nullable": true
+          },
+          "webhook_event_id": {
+            "type": "string",
+            "nullable": true,
+            "description": "Evento de webhook de origem, se houver."
+          },
+          "request_id": {
+            "type": "string",
+            "nullable": true,
+            "description": "Correlaciona com `X-Request-Id` e com os logs."
+          },
+          "metadata": {
+            "type": "object",
+            "nullable": true,
+            "additionalProperties": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Quando ocorreu."
+          }
+        }
+      },
+      "LeadEventList": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LeadEvent"
+            }
+          }
+        }
+      },
+      "CreateSellerRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "email"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 120,
+            "example": "Carlos Lima"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 254,
+            "description": "Único; convertido para minúsculas.",
+            "example": "carlos@example.com"
+          },
+          "active": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "UpdateSellerRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "active"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Seller": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "email",
+          "active",
+          "last_assigned_at",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Identificador do vendedor."
+          },
+          "name": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "last_assigned_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Última atribuição (critério do round-robin).",
+            "nullable": true
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Criação."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Última alteração."
+          }
+        }
+      },
+      "SellerList": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Seller"
+            }
+          }
+        }
+      },
+      "WebhookEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event_id",
+          "source",
+          "data"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 100,
+            "pattern": "^[\\w.:\\-]+$",
+            "description": "Id do evento no emissor. Com `source`, forma a chave de idempotência.",
+            "example": "evt_20261124_0001"
+          },
+          "source": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 60,
+            "pattern": "^[\\w.:\\- ]+$",
+            "description": "Letras, números e `. : _ -`.",
+            "example": "landing_page"
+          },
+          "data": {
+            "$ref": "#/components/schemas/CreateLeadRequest"
+          }
+        }
+      },
+      "WebhookAccepted": {
+        "type": "object",
+        "required": [
+          "status",
+          "event_id"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "accepted"
+            ]
+          },
+          "event_id": {
+            "type": "string"
+          }
+        }
+      },
+      "WebhookDuplicate": {
+        "type": "object",
+        "required": [
+          "status",
+          "event_id",
+          "processing_status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "duplicate"
+            ]
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "processing_status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "processing",
+              "processed",
+              "duplicate",
+              "dead"
+            ],
+            "description": "Situação atual do evento original."
+          }
+        }
+      },
+      "FieldIssue": {
+        "type": "object",
+        "required": [
+          "in",
+          "path",
+          "message"
+        ],
+        "properties": {
+          "in": {
+            "type": "string",
+            "enum": [
+              "body",
+              "query",
+              "params"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "example": "phone"
+          },
+          "message": {
+            "type": "string",
+            "example": "Telefone inválido"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "description": "Formato único de erro de toda a API.",
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message",
+              "request_id"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "INVALID_BODY",
+                  "UNAUTHORIZED",
+                  "NOT_FOUND",
+                  "LEAD_ALREADY_EXISTS",
+                  "SELLER_ALREADY_EXISTS",
+                  "EVENT_ID_REUSED",
+                  "PAYLOAD_TOO_LARGE",
+                  "VALIDATION_ERROR",
+                  "RATE_LIMITED",
+                  "SERVICE_UNAVAILABLE",
+                  "INTERNAL_ERROR"
+                ]
+              },
+              "message": {
+                "type": "string"
+              },
+              "details": {
+                "description": "Lista de `FieldIssue` (422) ou objeto com contexto (ex.: `{ \"lead_id\": \"...\" }` no 409).",
+                "oneOf": [
+                  {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/FieldIssue"
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                ]
+              },
+              "request_id": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded",
+              "unavailable"
+            ]
+          }
+        }
+      }
+    },
+    "responses": {
+      "InvalidBody": {
+        "description": "JSON malformado ou encoding não suportado.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "error": {
+                "code": "INVALID_BODY",
+                "message": "Corpo da requisição inválido",
+                "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f"
+              }
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "API key ausente/inválida, ou assinatura de webhook ausente/inválida/expirada (resposta sempre genérica; o motivo real só vai para o log).",
+        "headers": {
+          "WWW-Authenticate": {
+            "description": "Esquema esperado.",
+            "schema": {
+              "type": "string",
+              "example": "ApiKey"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "error": {
+                "code": "UNAUTHORIZED",
+                "message": "Credenciais ausentes ou inválidas",
+                "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f"
+              }
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Recurso inexistente.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "error": {
+                "code": "NOT_FOUND",
+                "message": "Lead não encontrado",
+                "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f"
+              }
+            }
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "Corpo acima de 50 KB (REST) ou 100 KB (webhook).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "error": {
+                "code": "PAYLOAD_TOO_LARGE",
+                "message": "Corpo da requisição excede o limite",
+                "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f"
+              }
+            }
+          }
+        }
+      },
+      "ValidationError": {
+        "description": "Campos inválidos, desconhecidos (`strict`) ou telefone inválido. Nada é persistido.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Dados inválidos",
+                "details": [
+                  {
+                    "in": "body",
+                    "path": "phone",
+                    "message": "Telefone inválido"
+                  }
+                ],
+                "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f"
+              }
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "Limite de requisições excedido.",
+        "headers": {
+          "Retry-After": {
+            "description": "Segundos até poder tentar de novo.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "error": {
+                "code": "RATE_LIMITED",
+                "message": "Muitas requisições",
+                "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f"
+              }
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "Erro inesperado (detalhes só no log, correlacionados pelo `request_id`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "Erro interno",
+                "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f"
+              }
+            }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "MySQL indisponível. Repita a requisição após `Retry-After`.",
+        "headers": {
+          "Retry-After": {
+            "description": "Sempre `5`.",
+            "schema": {
+              "type": "integer",
+              "example": 5
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "example": {
+              "error": {
+                "code": "SERVICE_UNAVAILABLE",
+                "message": "Serviço temporariamente indisponível",
+                "request_id": "0c0e5c0e-6f0e-4c3a-9d2b-1a2b3c4d5e6f"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
